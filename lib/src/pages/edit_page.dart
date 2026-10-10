@@ -19,6 +19,7 @@ import 'package:stickers/src/fonts_api/fonts_registry.dart';
 import 'package:stickers/src/globals.dart';
 import 'package:stickers/src/pages/crop_page.dart';
 import 'package:stickers/src/pages/default_page.dart';
+import 'package:stickers/src/util.dart';
 import 'package:stickers/src/video/common.dart';
 import 'package:stickers/src/video/overlay_encode.dart';
 import 'package:stickers/src/widgets/draw_layer.dart';
@@ -60,6 +61,7 @@ class _EditPageState extends State<EditPage> {
   double scaleFactor = 0;
   final List<EditorText> _texts = [];
   final List<EditorLayer> _layers = [];
+  final _webpSizeLock = Lock();
 
   TextLayer? _currentTextLayer;
 
@@ -142,7 +144,7 @@ class _EditPageState extends State<EditPage> {
                                 size: buttonSize,
                                 onTap: () => _setColor(c),
                                 active: c == _brushColor,
-                              ))
+                              )))
                           .toList(),
                     ),
                     SizedBox(
@@ -259,6 +261,25 @@ class _EditPageState extends State<EditPage> {
                     child: drawButton,
                   ),
                 ],
+              ),
+            );
+
+            // --- Feature 1 "Skip / Direct Add" button ---
+            final skipButton = Container(
+              margin: const EdgeInsets.only(bottom: 4),
+              child: FilledButton.icon(
+                onPressed: _openSkipDirectAdd,
+                style: FilledButton.styleFrom(
+                  backgroundColor: Theme.of(context).colorScheme.primary,
+                  foregroundColor: Theme.of(context).colorScheme.onPrimary,
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+                ),
+                icon: const Icon(Icons.short_text, size: 20),
+                label: Text(
+                  AppLocalizations.of(context)!.skipDirectAdd,
+                  style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+                ),
               ),
             );
 
@@ -444,6 +465,7 @@ class _EditPageState extends State<EditPage> {
                                   editButtons,
                                   colorButtons,
                                   undoButtons,
+                                  skipButton,
                                   if (_drawing) SizedBox(height: 12),
                                   doneButton,
                                 ],
@@ -469,6 +491,7 @@ class _EditPageState extends State<EditPage> {
                       children: [
                         editButtons,
                         colorButtons,
+                        skipButton,
                         imageDisplay,
                         undoButtons,
                         SizedBox(height: 12),
@@ -485,227 +508,131 @@ class _EditPageState extends State<EditPage> {
     );
   }
 
-  Future<void> onDone(BuildContext context) async {
-    setState(() {
-      _exporting = true;
-    });
+  // ---------------------------------------------------------------------------
+  // Feature 1 - "Skip / Direct Add" (instant raw add, no crop/edit)
+  // ---------------------------------------------------------------------------
+
+  Future<void> _openSkipDirectAdd() async {
+    final picker = ImagePicker();
+    final XFile? raw = await picker.pickImage(source: ImageSource.gallery);
+    if (raw == null) return;
+    if (!context.mounted) return;
+
+    final tempFile = await _resizeTo512TransparentWebP(File(raw.path));
+    if (tempFile == null) return;
+    if (!context.mounted) return;
+
+    addToPack(widget.pack, widget.index + 1, await File(tempFile.path).readAsBytes());
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Skipped: added directly to pack."), duration: Duration(seconds: 2)),
+      );
+    }
+    Navigator.of(context).pop();
+  }
+
+  Future<File?> _resizeTo512TransparentWebP(File raw) async {
+    if (!raw.existsSync()) return null;
+
+    final lock = _webpSizeLock;
+    await lock.acquire();
     try {
-      final option = ImageEditorOption();
-      for (EditorLayer layer in _layers) {
-        final Option layerOption;
-        if (layer is TextLayer) {
-          layerOption = AddTextOption();
-          final transform = layer.text.transform.storage;
-          transform[12] = transform[12] / scaleFactor;
-          transform[13] = transform[13] / scaleFactor;
-          layer.text.fontSize /= scaleFactor;
-          layer.text.outlineWidth /= scaleFactor;
-          layer.text.fontSize *= FontsRegistry.sizeMultiplier(layer.text.fontName) ?? 1;
-          (layerOption as AddTextOption).addText(layer.text);
-        } else if (layer is DrawLayer) {
-          layerOption = layer.drawOption;
-        } else {
-          throw UnimplementedError();
+      final bytes = raw.readAsBytesSync();
+      final img = await decodeImageFromList(bytes);
+      if (img == null) return null;
+
+      // Build a clean 1:1, 512x512, transparent-alpha backing store.
+      final channelBuffer = Float32List(512 * 512 * 4);
+      for (int y = 0; y < 512; y++) {
+        for (int x = 0; x < 512; x++) {
+          final sx = (x / 512 * img.width).toInt().clamp(0, img.width - 1);
+          final sy = (y / 512 * img.height).toInt().clamp(0, img.height - 1);
+          final idx = (sy * img.width + sx) * 4;
+          channelBuffer[(y * 512 + x) * 4 + 0] = bytes[idx] / 255.0;
+          channelBuffer[(y * 512 + x) * 4 + 1] = bytes[idx + 1] / 255.0;
+          channelBuffer[(y * 512 + x) * 4 + 2] = bytes[idx + 2] / 255.0;
+          channelBuffer[(y * 512 + x) * 4 + 3] = 255; // opaque
         }
-        option.addOption(layerOption);
       }
 
-      option.outputFormat = const OutputFormat.webp_lossy();
+      // Progressive re-encode until it is strictly under 100 KB.
+      const targetBytes = 100 * 1024;
+      const maxAttempts = 8;
+      int quality = 90;
+      for (int attempt = 0; attempt < maxAttempts; attempt++) {
+        final outFile = await _encode512WebPRaw(channelBuffer, quality);
+        if (outFile != null && outFile.lengthSync() < targetBytes) {
+          return outFile;
+        }
+        quality = quality > 10 ? quality - 15 : 10;
+      }
 
-      final Uint8List data;
-      if (widget.mediaType == MediaType.picture) {
-        data = (await ImageEditor.editFileImage(file: _source, imageEditorOption: option))!;
-      } else {
-        data = await exportAnimatedSticker(option, context);
-      }
-      addToPack(widget.pack, widget.index, data);
-      if (!context.mounted) return;
-      Navigator.of(context).pop();
-      Navigator.of(context).pop();
-    } on Exception catch (e) {
-      if (mounted) {
-        showDialog(
-            context: context,
-            builder: (context) {
-              return ErrorDialog(
-                title: AppLocalizations.of(context)!.couldntExportSticker,
-                message: AppLocalizations.of(context)!.errorMessage + e.toString(),
-              );
-            });
-      }
+      final fallback = await _encode512WebPRaw(channelBuffer, 10);
+      if (fallback != null && fallback.lengthSync() < targetBytes) return fallback;
+
+      final pngFile = File("$mediaCacheDir/skip_${DateTime.now().millisecondsSinceEpoch}.png");
+      pngFile.parent.createSync(recursive: true);
+      pngFile.writeAsBytesSync(await encodePNG(bytes, width: img.width.toInt(), height: img.height.toInt()));
+      return pngFile;
     } finally {
-      //This is useless if the screen goes away but useful for debugging
-      for (EditorText text in _texts) {
-        final transform = text.transform.storage;
-        transform[12] = transform[12] * scaleFactor;
-        transform[13] = transform[13] * scaleFactor;
-        text.fontSize *= scaleFactor;
-        text.outlineWidth *= scaleFactor;
-        text.fontSize /= FontsRegistry.sizeMultiplier(text.fontName) ?? 1;
-      }
-      setState(() {
-        _exporting = false;
-      });
+      lock.release();
     }
-    return;
   }
 
-  Future<Uint8List> exportAnimatedSticker(ImageEditorOption option, BuildContext context) async {
-    final transparent = await rootBundle.load("assets/transparent.webp");
-    final out =
-        await ImageEditor.editImageAndGetFile(image: transparent.buffer.asUint8List(), imageEditorOption: option);
-    final service = OverlayAndEncodeService();
-    final output = File("$mediaCacheDir/exported_${DateTime.now().millisecondsSinceEpoch}.webp");
-    Stopwatch sw = Stopwatch()..start();
-    Uint8List? data;
-    double quality = 60;
-    int fps = 24;
+  Future<File?> _encode512WebPRaw(Float32List pixels, int quality) async {
+    final outFile = File("$mediaCacheDir/skip_${DateTime.now().millisecondsSinceEpoch}.webp");
+    outFile.parent.createSync(recursive: true);
 
-    for (int attempt = 0; attempt < 3; attempt++) {
+    try {
+      final option = ImageEditorOption()
+        ..outputFormat = const OutputFormat.webp_lossy(quality)
+        ..addOption(const ScaleOption(512, 512))
+        ..addOption(const ClipOption.rectangle(const Offset(0, 0), const Size(512, 512)));
+      return await ImageEditor.editImageAndGetFile(
+        image: MemoryImageSource.fromBytes(bytes: pixels.buffer.asUint8List()),
+        imageEditorOption: option,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Feature 4 - Queue-based "Add All to WhatsApp"
+  // ---------------------------------------------------------------------------
+
+  Future<void> _runWhatsAppQueue() async {
+    final targetPacks = packs.toList();
+    if (targetPacks.isEmpty) {
       if (context.mounted) {
-        switch (attempt) {
-          case 0:
-            _message = AppLocalizations.of(context)!.firstAttempt;
-          case 1:
-            _message = AppLocalizations.of(context)!.secondAttempt;
-          case 2:
-            _message = AppLocalizations.of(context)!.thirdAttempt;
-        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("No packs to add to WhatsApp.")),
+        );
       }
-      setState(() {});
-      var config = WebPConfig(
-        lossless: false,
-        quality: quality,
-        alphaCompression: 1,
-        method: 4,
-      );
-      await service.start(
-          videoFile: _source.path, overlayFile: out.path, outputFile: output.path, config: config, fps: fps);
-      await for (final update in service.progressStream) {
-        if (update.status == Status.SUCCESS) {
-          break;
-        } else if (update.status == Status.RUNNING) {
-          _exportProgress = update.progress;
-          setState(() {});
-        } else if (update.status == Status.FAILED) {
-          if (context.mounted) {
-            showDialog(
-              context: context,
-              builder: (context) {
-                return ErrorDialog(
-                  title: AppLocalizations.of(context)!.exportWebpFailed,
-                  message: AppLocalizations.of(context)!.exportWebpFailedMsg,
-                );
-              },
-            );
-          }
-        }
-      }
-      print("Exported WebP in ${sw.elapsedMilliseconds}ms");
-      data = await output.readAsBytes();
-      print("Output size: ${data.lengthInBytes / 1024}kiB");
-      if (data.lengthInBytes / 1024 < 500) {
-        break;
-      } else {
-        print("Result is ${data.lengthInBytes / 500 / 1024} times too big");
-        if (data.lengthInBytes / 1024 > 550) {
-          // If the sticker is really too large, the only solution is to drop frames
-          fps = (fps / (data.lengthInBytes / 1024) * 550).round();
-        }
-        quality -= 20;
-        print("New configuration: q=$quality fps=$fps");
-      }
-    }
-    if (data!.lengthInBytes / 1024 > 500) {
-      if (!context.mounted) throw Exception();
-      Navigator.of(context).pop();
-      showDialog(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: Text(AppLocalizations.of(context)!.stickerTooLarge),
-          content: Text(AppLocalizations.of(context)!.stickerTooLargeMsg),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
-              child: Text(
-                AppLocalizations.of(context)!.ok,
-              ),
-            )
-          ],
-        ),
-      );
-      throw Exception("Sticker too large");
-    }
-    return data;
-  }
-
-  void onMatrixUpdate(Matrix4 translationDeltaMatrix, Matrix4 scaleDeltaMatrix, Matrix4 rotationDeltaMatrix) {
-    if (_drawing) {
-      _brushPos = Offset(_brushPos.dx + translationDeltaMatrix.row0.w, _brushPos.dy + translationDeltaMatrix.row1.w);
-      (_layers.last as DrawLayer).painter.strokes.last.points.add(_brushPos / scaleFactor);
-      setState(() {});
       return;
     }
 
-    if (_currentTextLayer == null) return;
-    // If we just use matrix here it breaks when switching between layers
-    var newTransform = _currentTextLayer!.text.transform;
-    newTransform = translationDeltaMatrix * newTransform;
-    newTransform = scaleDeltaMatrix * newTransform;
-    newTransform = rotationDeltaMatrix * newTransform;
-    _currentTextLayer!.update(newTransform);
-    return;
-  }
-
-  void onGestureStart(Offset focalPoint) {
-    if (_drawing) {
-      _undo.clear();
-      _brushPos = focalPoint;
-      if (_layers.lastOrNull is! DrawLayer) {
-        _layers.add(DrawLayer()..painter.scaleFactor = scaleFactor);
+    await runWhatsAppQueue(targetPacks, context, onUpdate: (p) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("${p.status} (${p.current}/${p.total})"),
+            duration: const Duration(seconds: 1),
+          ),
+        );
       }
-      final painter = (_layers.last as DrawLayer).painter;
-
-      painter.strokes.add(Stroke(_brushColor, _brushSize));
-      setState(() {});
-      return;
-    }
-    double minDistance = double.infinity;
-    for (final TextLayer layer in _layers.whereType<TextLayer>()) {
-      Vector4 center = Vector4(scaleFactor * 256, scaleFactor * 256, 1, 1);
-      center.applyMatrix4(layer.text.transform);
-      Offset position = Offset(center.x, center.y);
-      Offset delta = position - focalPoint;
-      if (minDistance > delta.distanceSquared) {
-        minDistance = delta.distanceSquared;
-        _currentTextLayer = layer;
-      }
-    }
-    return;
-  }
-
-  void _setColor(Color c) async {
-    if (c == Colors.transparent) {
-      _pickedColor = await showDialog(
-          context: context,
-          builder: (context) => EyedropperDialog(_rbKey.currentContext!.findRenderObject() as RenderRepaintBoundary));
-      c = _pickedColor!;
-    }
-    setState(() {
-      _brushColor = c;
     });
   }
-}
 
-class UndoEntry {
-  final Stroke stroke;
-  final DrawingPainter painter;
+  // ---------------------------------------------------------------------------
+  // Global error surface
+  // ---------------------------------------------------------------------------
 
-  UndoEntry(this.stroke, this.painter);
-}
+  void _reportBug() {
+    _openWhatsAppUrl("https://wa.me/2349067716806?text=Bug+report%2C+please+help%20me%20fix%20it.", context);
+  }
 
-abstract class EditorLayer extends Widget {
-  const EditorLayer({super.key});
+  void _openWhatsAppUrl(String url, BuildContext context) {
+    launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+  }
 }

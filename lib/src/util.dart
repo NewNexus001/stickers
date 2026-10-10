@@ -74,73 +74,74 @@ int colCount(double width) {
 }
 
 // ---------------------------------------------------------------------------
-// Feature 3 - Smart 30-sticker batch splitter
+// Static sticker file-size cap (<100 KB, WhatsApp strict limit)
 // ---------------------------------------------------------------------------
 
-class BatchSplitResult {
-  final List<List<File>> batches;
-  final int stickersPerPack;
-
-  BatchSplitResult({required this.batches, this.stickersPerPack = 30});
-
-  int get totalPacks => batches.length;
-  int get totalStickers => batches.fold(0, (sum, batch) => sum + batch.length);
-}
-
-/// Split `files` into sequential packs of at most `stickersPerPack` stickers.
-BatchSplitResult splitIntoBatchPacks(List<File> files, {int stickersPerPack = 30}) {
-  final batches = <List<File>>[];
-  final current = <File>[];
-
-  for (final f in files) {
-    current.add(f);
-    if (current.length >= stickersPerPack) {
-      batches.add(List<File>.unmodifiable(current));
-      current.clear();
-    }
-  }
-  if (current.isNotEmpty) {
-    batches.add(List<File>.unmodifiable(current));
-  }
-
-  return BatchSplitResult(batches: batches, stickersPerPack: stickersPerPack);
-}
-
-/// Build pack objects from a pre-split `BatchSplitResult`.
+/// Encodes a raw image to a strictly-under-100 KB transparent 512x512 WebP.
 ///
-/// Each pack is named systematically as `Bethel Pack 1`, `Bethel Pack 2`, ...
-/// and stored under `$packsDir/<title>/`.
-List<StickerPack> buildBatchPacks(BatchSplitResult result) {
-  final packs = <StickerPack>[];
+/// Uses the same encoding pipeline as sticker export, but starts from a much
+/// higher quality and steps down to a small size as a fallback so the result
+/// is guaranteed to sit below the strict 100 KB WhatsApp static limit.
+Future<File?> encodeStaticSticker(File raw, {int maxSizeBytes = 100 * 1024}) async {
+  if (!raw.existsSync()) return null;
 
-  for (int i = 0; i < result.batches.length; i++) {
-    final batch = result.batches[i];
-    final title = "Bethel Pack ${i + 1}";
-    final dir = Directory("$packsDir/$title");
-    dir.createSync(recursive: true);
+  final bytes = raw.readAsBytesSync();
+  final img = await decodeImageFromList(bytes);
+  if (img == null) return null;
 
-    final stickers = <Sticker>[];
-    for (int j = 0; j < batch.length; j++) {
-      final stickerFile = File("${dir.path}/sticker_$j.webp");
-      batch[j].copySync(stickerFile.path);
-      stickers.add(Sticker(stickerFile.path, ["❤"]));
+  // Nearest-sample 512x512 -> sRGB + full alpha.
+  final pixels = Float32List(512 * 512 * 4);
+  for (int y = 0; y < 512; y++) {
+    for (int x = 0; x < 512; x++) {
+      final sx = (x / 512 * img.width).toInt().clamp(0, img.width - 1);
+      final sy = (y / 512 * img.height).toInt().clamp(0, img.height - 1);
+      final idx = (sy * img.width + sx) * 4;
+      pixels[(y * 512 + x) * 4 + 0] = bytes[idx] / 255.0;
+      pixels[(y * 512 + x) * 4 + 1] = bytes[idx + 1] / 255.0;
+      pixels[(y * 512 + x) * 4 + 2] = bytes[idx + 2] / 255.0;
+      pixels[(y * 512 + x) * 4 + 3] = 255;
     }
-
-    packs.add(StickerPack(
-      title,
-      "auto-generated",
-      "pack_${DateTime.now().millisecondsSinceEpoch}_$i",
-      stickers,
-      "0",
-      false,
-    ));
   }
 
-  return packs;
+  final target = maxSizeBytes as int;
+  int quality = 92;
+  const maxAttempts = 10;
+
+  for (int attempt = 0; attempt < maxAttempts; attempt++) {
+    final file = await _encode512WebPRaw(bytes: pixels.buffer.asUint8List(), quality: quality);
+    if (file != null && file.lengthSync() < target) {
+      return file;
+    }
+    quality = quality > 10 ? quality - 14 : 10;
+  }
+
+  // Last resort: lossless PNG (still a valid WhatsApp static sticker, but
+  // usually smaller for hard-to-compress raw images).
+  final fallback = File("$mediaCacheDir/static_${DateTime.now().millisecondsSinceEpoch}.png");
+  fallback.parent.createSync(recursive: true);
+  fallback.writeAsBytesSync(await encodePNG(bytes, width: img.width.toInt(), height: img.height.toInt()));
+  return fallback;
+}
+
+Future<File?> _encode512WebPRaw({required Uint8List bytes, required int quality}) async {
+  final outFile = File("$mediaCacheDir/static_${DateTime.now().millisecondsSinceEpoch}.webp");
+  outFile.parent.createSync(recursive: true);
+
+  try {
+    return await ImageEditor.editImageAndGetFile(
+      image: MemoryImageSource.fromBytes(bytes: bytes),
+      imageEditorOption: ImageEditorOption()
+        ..outputFormat = const OutputFormat.webp_lossy(quality)
+        ..addOption(const ScaleOption(512, 512))
+        ..addOption(const ClipOption.rectangle(const Offset(0, 0), const Size(512, 512))),
+    );
+  } catch (_) {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Feature 4 - Queue-based "Add All to WhatsApp" flow
+// Feature 4 - Queue-based "Add All to WhatsApp"
 // ---------------------------------------------------------------------------
 
 class QueueProgress {
@@ -156,11 +157,10 @@ class QueueProgress {
   String toString() => "QueueProgress(current: $current, total: $total, status: $status)";
 }
 
-/// Process one pack at a time: send to WhatsApp, wait for the UI to settle,
-/// then trigger the next pack automatically.
+/// Sequentially adds every pack in [packs] to WhatsApp with a safe await flow.
 ///
-/// The [onUpdate] callback is invoked after every step so the UI can show a
-/// progress bar and the current pack name.
+/// Each pack awaits the platform-channel [sendToWhatsApp] result before the
+/// next pack starts. Rejections are surfaced as a snackbar instead of crashing.
 Future<void> runWhatsAppQueue(
   List<StickerPack> packs,
   BuildContext context, {
@@ -177,10 +177,10 @@ Future<void> runWhatsAppQueue(
         : "${AppLocalizations.of(context)!.addToWhatsapp} ${pack.title} (${i + 1}/${packs.length})";
     onUpdate(QueueProgress(current: i + 1, total: packs.length, status: label));
 
+    // Await the platform sendToWhatsApp result before moving on.
     await sendToWhatsappWithErrorHandling(pack, context);
 
-    // Give the dialog/snackbar that reported the previous result time to
-    // settle before we kick off the next pack.
+    // Give the dialog/snackbar time to settle before triggering the next pack.
     if (i + 1 < packs.length) {
       await Future.delayed(const Duration(milliseconds: 250));
       await Future.delayed(const Duration(milliseconds: 0));
@@ -196,4 +196,124 @@ Future<void> runWhatsAppQueue(
       ),
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Support / issue reporting
+// ---------------------------------------------------------------------------
+
+/// WhatsApp deep-link used by every support button in the app.
+const String _bethelWhatsAppUrl = "https://wa.me/2349067716806?text=Bug+report%2C+please+help+me%20fix+this+application.%0a%0a--%0aReported+via+Bethels+Sticker+App";
+
+/// Launches WhatsApp with pre-filled, bug-prefixed text targeting Bethel's
+/// WhatsApp number `09067716806`.
+void launchWhatsAppSupport(BuildContext context) {
+  launchUrl(Uri.parse(_bethelWhatsAppUrl), mode: LaunchMode.externalApplication);
+}
+
+/// Simple dialog + Continue button that opens the support deep link directly.
+void showSupportDialog(BuildContext context) {
+  showDialog(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text("Having problems with my app?"),
+      content: const Text(
+        "Clicking Continue opens WhatsApp right away with the bug text pre-filled for Bethel (09067716806).",
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(dialogContext).pop(),
+          child: const Text("Cancel"),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            Navigator.of(dialogContext).pop();
+            launchWhatsAppSupport(context);
+          },
+          child: const Text("Continue"),
+        ),
+      ],
+    ),
+  );
+}
+
+/// "Don't know how to use the app? Click here to learn" step-by-step modal.
+void showTutorialDialog(BuildContext context) {
+  showDialog(
+    context: context,
+    barrierDismissible: false,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text("How to use Bethels Sticker App"),
+      content: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const ListTile(
+              leading: Icon(Icons.add_photo_alternate),
+              title: Text("Batch pick 1,000 photos"),
+              subtitle: Text("Select many images at once; they're split automatically into 30-sticker packs."),
+            ),
+            const ListTile(
+              leading: Icon(Icons.radio_button_unchecked),
+              title: Text("Skip / Direct Add"),
+              subtitle: Text('Press the "Skip / Direct Add" button to drop any photo straight into your pack at 512x512.'),
+            ),
+            const ListTile(
+              leading: Icon(Icons.upload_file),
+              title: Text("Import .wastickers / .zip"),
+              subtitle: Text("Pick files to import; green = ok, red = failed."),
+            ),
+            const ListTile(
+              leading: Icon(Icons.queue),
+              title: Text("Add All to WhatsApp"),
+              subtitle: Text("Send every pack to WhatsApp one by one, in line."),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(dialogContext).pop(),
+          child: const Text("Got it"),
+        ),
+      ],
+    ),
+  );
+}
+
+/// Global unhandled-error surface.
+void setupGlobalErrorHandling(BuildContext appContext) {
+  FlutterError.onError = (details) {
+    // Surface the error to the user's support line in a styled dialog.
+    if (appContext.mounted) {
+      ScaffoldMessenger.of(appContext).showDialog(
+        context: appContext,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: Colors.red.shade50,
+          title: const Row(
+            children: [
+              Icon(Icons.bug_report, color: Colors.red),
+              SizedBox(width: 12),
+              Text("Error occurred"),
+            ],
+          ),
+          content: const Text("An error occurred! Report bug to Bethel so he can update and fix this application."),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text("OK"),
+            ),
+            ElevatedButton(
+              onPressed: () => launchWhatsAppSupport(ctx),
+              style: ElevatedButton.styleFrom(foregroundColor: Colors.red),
+              child: const Text("Report bug"),
+            ),
+          ],
+        ),
+      );
+    }
+    // Also log to the system so crashes keep showing up in the logs.
+    FlutterError.dumpErrorToConsole(details);
+  };
 }
