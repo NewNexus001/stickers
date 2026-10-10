@@ -1,5 +1,4 @@
 import 'dart:io';
-
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:stickers/generated/intl/app_localizations.dart';
@@ -9,6 +8,7 @@ import 'package:stickers/src/dialogs/create_pack_dialog.dart';
 import 'package:stickers/src/dialogs/error_dialog.dart';
 import 'package:stickers/src/globals.dart';
 import 'package:stickers/src/pages/default_page.dart';
+import 'package:stickers/src/data/batch_import.dart';
 import 'package:stickers/src/widgets/sticker_pack_preview_card.dart';
 
 class StickerPacksPage extends StatefulWidget {
