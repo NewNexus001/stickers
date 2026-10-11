@@ -30,6 +30,12 @@ jobs:
       - name: Generate Localizations
         run: flutter gen-l10n
 
+      - name: Ensure Gradle Wrapper Version
+        run: |
+          cd android
+          ./gradlew wrapper --gradle-version 8.14.1 --distribution-type bin
+          cd ..
+
       - name: Build Android APK
         run: flutter build apk --release --android-skip-build-dependency-validation
 
