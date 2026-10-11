@@ -76,6 +76,12 @@ android {
         release {
             if (keystoreProperties["storeFile"] != null && keystoreProperties["storeFile"] != "") {
                 signingConfig signingConfigs.release
+            } else {
+                // No keystore configured (e.g. CI): fall back to the debug signing
+                // config so the release APK is signed and can actually be installed.
+                // Android refuses to install unsigned APKs. Replace with a real
+                // keystore via key.properties before publishing to a store.
+                signingConfig signingConfigs.debug
             }
         }
     }
