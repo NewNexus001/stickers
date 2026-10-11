@@ -62,13 +62,21 @@ android {
         create("release") {
             keyAlias = keystoreProperties["keyAlias"]
             keyPassword = keystoreProperties["keyPassword"]
-            storeFile = new File(keystoreProperties["storeFile"])
-            storePassword = keystoreProperties["storePassword"]
+            def storeFileValue = keystoreProperties["storeFile"]
+            def storePasswordValue = keystoreProperties["storePassword"]
+            if (storeFileValue != null && storeFileValue != "") {
+                storeFile = new File(storeFileValue)
+            }
+            if (storePasswordValue != null && storePasswordValue != "") {
+                storePassword = storePasswordValue
+            }
         }
     }
     buildTypes {
         release {
-            signingConfig signingConfigs.release
+            if (keystoreProperties["storeFile"] != null && keystoreProperties["storeFile"] != "") {
+                signingConfig signingConfigs.release
+            }
         }
     }
     externalNativeBuild {
